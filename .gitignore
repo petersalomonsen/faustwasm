@@ -96,3 +96,10 @@ assets/standalone/faust-ui
 assets/standalone/faustwasm
 test/faustlive-wasm/faust-ui
 test/faustlive-wasm/faustwasm
+
+# Built libfaust-wasm artifacts — rebuilt by .github/workflows/publish.yml
+# (kept out of git, included in npm tarball via .npmignore not listing them)
+libfaust-wasm/libfaust-wasm.js
+libfaust-wasm/libfaust-wasm.cjs
+libfaust-wasm/libfaust-wasm.wasm
+libfaust-wasm/libfaust-wasm.data

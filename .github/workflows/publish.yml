@@ -1,0 +1,117 @@
+name: Build & publish
+
+on:
+  push:
+    branches: [master, 'wip/**']
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  id-token: write   # needed for npm trusted publishing (OIDC)
+
+env:
+  # Pin the upstream Faust commit we build libfaust-wasm from. Bump this when
+  # picking up a newer Faust version. The asc backend is enabled by patching
+  # build/backends/regular.cmake at this commit (see "Patch Faust" step below).
+  FAUST_REPO: grame-cncm/faust
+  FAUST_REF: 938f87ca38f9b86a99058ec1d752396d2d788ae6   # "Set version to 2.85.3."
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out faustwasm
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.45
+          actions-cache-folder: emsdk-cache
+
+      - name: Check out Faust
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FAUST_REPO }}
+          ref: ${{ env.FAUST_REF }}
+          path: faust
+
+      - name: Patch Faust to enable AssemblyScript backend in libfaust-wasm
+        run: |
+          # The upstream regular.cmake omits WASM from AS_BACKEND, so the asc
+          # backend isn't compiled into libfaust-wasm. Add it.
+          sed -i 's|^set ( AS_BACKEND     COMPILER STATIC DYNAMIC      |set ( AS_BACKEND     COMPILER STATIC DYNAMIC WASM |' \
+              faust/build/backends/regular.cmake
+          grep -n AS_BACKEND faust/build/backends/regular.cmake
+
+      - name: Build libfaust-wasm with asc backend
+        working-directory: faust/build
+        run: |
+          make cmake BACKENDS=regular.cmake
+          make wasmlib JOBS=-j$(nproc)
+          ls -la lib/libfaust-wasm.*
+
+      - name: Stage built libfaust-wasm into faustwasm tree
+        run: |
+          cp faust/build/lib/libfaust-wasm.js   libfaust-wasm/libfaust-wasm.js
+          cp faust/build/lib/libfaust-wasm.wasm libfaust-wasm/libfaust-wasm.wasm
+          cp faust/build/lib/libfaust-wasm.data libfaust-wasm/libfaust-wasm.data
+
+      - name: Install JS deps & build the wrapper
+        run: |
+          npm ci
+          npm run build
+
+      - name: Smoke-test the asc backend through the wasm compiler
+        run: |
+          node --input-type=module -e "
+            import('./dist/esm/index.js').then(async (m) => {
+              const mod = await m.instantiateFaustModuleFromFile('./libfaust-wasm/libfaust-wasm.js');
+              const c = new m.FaustCompiler(new m.LibFaust(mod));
+              console.log('faust:', c.version());
+              const ok = c.generateAuxFiles('Probe',
+                'import(\"stdfaust.lib\"); process = os.osc(440) <: _,_;',
+                '-lang asc -cn Probe -o /Probe.ts');
+              if (!ok) { console.error(c.getErrorMessage()); process.exit(1); }
+              const out = mod.FS.readFile('/Probe.ts', { encoding: 'utf8' });
+              if (!out.includes('export class Probe')) {
+                console.error('asc output missing expected class'); process.exit(1);
+              }
+              console.log('asc backend OK,', out.length, 'bytes');
+            });
+          "
+
+      - name: Decide whether to publish
+        id: gate
+        run: |
+          set -e
+          PKG_NAME=$(node -p "require('./package.json').name")
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          # `npm view` exits non-zero if the package doesn't exist yet — first publish
+          PUB_VERSION=$(npm view "$PKG_NAME" dist-tags.latest 2>/dev/null || echo "none")
+          BRANCH="${GITHUB_REF##*/}"
+          echo "package=$PKG_NAME"
+          echo "published=$PUB_VERSION"
+          echo "package_version=$NEW_VERSION"
+          echo "branch=$BRANCH"
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$BRANCH" == "master" && "$PUB_VERSION" != "$NEW_VERSION" ]]; then
+            echo "publish=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm (trusted publishing — no NPM_TOKEN)
+        if: steps.gate.outputs.publish == 'true'
+        run: npm publish --provenance --access public
+
+      - name: Dry-run publish (PRs / WIP branches / no version bump)
+        if: steps.gate.outputs.publish != 'true'
+        run: npm publish --dry-run --access public
