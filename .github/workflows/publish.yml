@@ -31,6 +31,11 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Pin CMake (3.31+ on the runner emits link-time --dependency-file= which emcc rejects)
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.26.6'
+
       - name: Set up Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
@@ -60,16 +65,12 @@ jobs:
       - name: Build libfaust-wasm with asc backend
         working-directory: faust/build
         run: |
+          cmake --version
           make cmake BACKENDS=regular.cmake
-          # ubuntu-latest's cmake 3.31 emits "--dependency-file=..." into the
-          # link command for wasmlib, which emcc's wasm-ld rejects with
-          #   wasm-ld: error: unknown argument: --dependency-file=...
-          # Local cmake (also 3.31.x) doesn't emit it; appears to be a
-          # generator/cache subtlety. Strip it from the generated link.txt
-          # before the build runs.
-          if [ -f faustdir/emcc/CMakeFiles/wasmlib.dir/link.txt ]; then
-            sed -i 's| --dependency-file=[^ ]*||g' faustdir/emcc/CMakeFiles/wasmlib.dir/link.txt
-          fi
+          # Defensive strip just in case any --dependency-file=... slips into
+          # the link step (wasm-ld rejects it). 3.26.6 shouldn't emit it.
+          find faustdir/emcc -type f \( -name 'link.txt' -o -name 'build.make' \) \
+            -exec sed -i 's| --dependency-file=[^ ]*||g' {} +
           make wasmlib JOBS=-j$(nproc)
           ls -la lib/libfaust-wasm.*
 
