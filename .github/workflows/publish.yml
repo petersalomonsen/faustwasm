@@ -34,7 +34,11 @@ jobs:
       - name: Set up Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 3.1.45
+          # 3.1.x is what Faust upstream targets but its bundled wasm-ld
+          # doesn't accept the --dependency-file= flag that newer CMake on
+          # ubuntu-latest now emits. 5.0.7 is what we used locally to build
+          # the published @psalomo/faustwasm@0.16.1-asc.0 binary.
+          version: 5.0.7
           actions-cache-folder: emsdk-cache
 
       - name: Check out Faust
