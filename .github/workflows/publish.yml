@@ -61,6 +61,15 @@ jobs:
         working-directory: faust/build
         run: |
           make cmake BACKENDS=regular.cmake
+          # ubuntu-latest's cmake 3.31 emits "--dependency-file=..." into the
+          # link command for wasmlib, which emcc's wasm-ld rejects with
+          #   wasm-ld: error: unknown argument: --dependency-file=...
+          # Local cmake (also 3.31.x) doesn't emit it; appears to be a
+          # generator/cache subtlety. Strip it from the generated link.txt
+          # before the build runs.
+          if [ -f faustdir/emcc/CMakeFiles/wasmlib.dir/link.txt ]; then
+            sed -i 's| --dependency-file=[^ ]*||g' faustdir/emcc/CMakeFiles/wasmlib.dir/link.txt
+          fi
           make wasmlib JOBS=-j$(nproc)
           ls -la lib/libfaust-wasm.*
 
