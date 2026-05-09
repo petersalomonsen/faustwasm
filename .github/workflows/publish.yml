@@ -43,6 +43,7 @@ jobs:
           repository: ${{ env.FAUST_REPO }}
           ref: ${{ env.FAUST_REF }}
           path: faust
+          submodules: recursive   # libraries/ is a submodule (faustlibraries) — wasmlib target needs *.lib files
 
       - name: Patch Faust to enable AssemblyScript backend in libfaust-wasm
         run: |
