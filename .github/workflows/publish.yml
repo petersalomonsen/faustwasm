@@ -86,13 +86,15 @@ jobs:
           # Upstream's "build" script parallelizes via `&`, racing
           # postbuild-bundled.js (which copies dist/cjs/index.d.ts) against
           # build-types (which produces it). Run sequentially.
+          # Skip build-{cjs,esm}-bundle / build-types-bundle: they bundle
+          # libfaust-wasm.cjs inline via esbuild, which fails on emcc 5.x's
+          # `require("node:fs")` / `node:crypto` calls (upstream's externals
+          # list predates the `node:` prefix). package.json's main/module
+          # fields point at dist/cjs and dist/esm, which is what consumers
+          # actually use.
           npm run build-cjs
-          npm run build-cjs-bundle
           npm run build-esm
-          npm run build-esm-bundle
           npm run build-types
-          npm run build-types-bundle
-          node postbuild-bundled.js
 
       - name: Smoke-test the asc backend through the wasm compiler
         run: |
