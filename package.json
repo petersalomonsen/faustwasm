@@ -1,5 +1,5 @@
 {
-    "name": "@petersalomonsen/faustwasm",
+    "name": "@psalomo/faustwasm",
     "version": "0.16.1-asc.0",
     "description": "WebAssembly version of Faust Compiler — fork with the AssemblyScript (asc) backend enabled in libfaust-wasm.",
     "main": "dist/cjs/index.js",
