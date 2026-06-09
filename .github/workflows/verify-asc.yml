@@ -1,0 +1,142 @@
+name: Verify asc backend (no patch) + compare to @psalomo
+
+# Proves that faust PR #1261 (AS_BACKEND += WASM, committed in faust SOURCE)
+# is sufficient on its own to build an asc-enabled libfaust-wasm — NO sed patch
+# here — and that its `-lang asc` output matches the published @psalomo binary
+# the WebAssembly Music webapp currently runs on. Uploads the built binary.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['verify/**']
+
+permissions:
+  contents: read
+
+env:
+  FAUST_REPO: petersalomonsen/faust
+  FAUST_REF: asc-wasm-backend          # PR #1261 branch: master-dev + the one-liner, NO other patch
+  PSALOMO_VERSION: 0.16.1-asc.0        # the binary the webapp consumes today
+
+jobs:
+  build-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out faustwasm
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Pin CMake (3.31+ emits link-time --dependency-file= which emcc rejects)
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.26.6'
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 5.0.7
+          actions-cache-folder: emsdk-cache
+
+      - name: Check out Faust (PR #1261 branch — asc enabled in source, no patch)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FAUST_REPO }}
+          ref: ${{ env.FAUST_REF }}
+          path: faust
+          submodules: recursive
+
+      - name: Confirm AS_BACKEND already has WASM in source (no patch applied)
+        run: |
+          echo "AS_BACKEND line in faust source:"
+          grep -n 'AS_BACKEND' faust/build/backends/regular.cmake
+          grep -qE '^set \( AS_BACKEND .*\bWASM\b' faust/build/backends/regular.cmake \
+            || { echo "::error::AS_BACKEND lacks WASM in source — the one-liner is not present"; exit 1; }
+
+      - name: Build libfaust-wasm (no sed patch)
+        working-directory: faust/build
+        run: |
+          make cmake BACKENDS=regular.cmake
+          find faustdir/emcc -type f \( -name 'link.txt' -o -name 'build.make' \) \
+            -exec sed -i 's| --dependency-file=[^ ]*||g' {} +
+          make wasmlib JOBS=-j$(nproc)
+          ls -la lib/libfaust-wasm.*
+
+      - name: Stage built libfaust-wasm + build the wrapper
+        run: |
+          cp faust/build/lib/libfaust-wasm.js   libfaust-wasm/libfaust-wasm.js
+          cp faust/build/lib/libfaust-wasm.wasm libfaust-wasm/libfaust-wasm.wasm
+          cp faust/build/lib/libfaust-wasm.data libfaust-wasm/libfaust-wasm.data
+          npm ci
+          npm run build-cjs
+          npm run build-esm
+          npm run build-types
+
+      - name: Get the webapp DSP corpus + the published @psalomo package
+        run: |
+          # the webapp's real DSPs
+          git clone --depth 1 https://github.com/petersalomonsen/javascriptmusic jm
+          mkdir -p corpus
+          cp jm/examples/dx7/dsp/*.dsp corpus/ 2>/dev/null || true
+          cp jm/examples/master_me/dsp/*.dsp corpus/ 2>/dev/null || true
+          # the published binary the webapp consumes today
+          npm pack @psalomo/faustwasm@${PSALOMO_VERSION}
+          tar xzf psalomo-faustwasm-*.tgz
+          ls corpus
+
+      - name: Transpile every webapp DSP with BOTH binaries and compare asc output
+        run: |
+          node --input-type=module - <<'NODE'
+          import fs from 'fs';
+          import path from 'path';
+          const load = async (pkgDir) => {
+            const m = await import(path.resolve(pkgDir, 'dist/esm/index.js'));
+            const mod = await m.instantiateFaustModuleFromFile(path.resolve(pkgDir, 'libfaust-wasm/libfaust-wasm.js'));
+            const c = new m.FaustCompiler(new m.LibFaust(mod));
+            return { m, mod, c, ver: c.version() };
+          };
+          const built   = await load('.');                       // freshly built (PR #1261, no patch)
+          const psalomo = await load('package');                 // published @psalomo
+          console.log('built faust  :', built.ver);
+          console.log('@psalomo faust:', psalomo.ver);
+
+          const gen = (eng, name, src) => {
+            const out = '/' + name + '.ts';
+            const ok = eng.c.generateAuxFiles(name, src, `-lang asc -cn ${name} -I /work -o ${out}`);
+            if (!ok) return { ok:false, err: eng.c.getErrorMessage() };
+            return { ok:true, ts: eng.mod.FS.readFile(out, { encoding:'utf8' }) };
+          };
+
+          // mount stdfaust libs are bundled in the wasm fs; -I /work for local imports
+          const dir = 'corpus';
+          const files = fs.readdirSync(dir).filter(f => f.endsWith('.dsp'));
+          let fail = 0, identical = 0, differ = 0;
+          for (const f of files) {
+            const name = f.replace(/[^A-Za-z0-9]/g,'_').replace(/\.dsp$/i,'');
+            const src = fs.readFileSync(path.join(dir,f),'utf8');
+            // make local imports resolvable
+            built.mod.FS.mkdir?.('/work'); try { built.mod.FS.writeFile('/work/'+f, src); } catch(e){}
+            psalomo.mod.FS.mkdir?.('/work'); try { psalomo.mod.FS.writeFile('/work/'+f, src); } catch(e){}
+            const a = gen(built, name, src);
+            const b = gen(psalomo, name, src);
+            if (!a.ok) { console.log(`FAIL  ${f}: built binary error: ${a.err}`); fail++; continue; }
+            if (!a.ts.includes('export class')) { console.log(`FAIL  ${f}: built output missing 'export class'`); fail++; continue; }
+            if (b.ok && a.ts === b.ts) { console.log(`SAME  ${f}  (${a.ts.length} B, identical to @psalomo)`); identical++; }
+            else if (b.ok) { console.log(`DIFF  ${f}  built=${a.ts.length}B psalomo=${b.ts.length}B (valid asc, differs — check faust version)`); differ++; }
+            else { console.log(`OKnew ${f}  built=${a.ts.length}B (@psalomo could not generate: ${b.err})`); differ++; }
+          }
+          console.log(`\nSUMMARY: ${files.length} DSPs | identical=${identical} differ=${differ} fail=${fail}`);
+          if (fail > 0) { console.error('::error::built binary failed to produce valid asc for some webapp DSPs'); process.exit(1); }
+          NODE
+
+      - name: Upload built libfaust-wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfaust-wasm-asc-from-source
+          path: |
+            libfaust-wasm/libfaust-wasm.js
+            libfaust-wasm/libfaust-wasm.wasm
+            libfaust-wasm/libfaust-wasm.data
