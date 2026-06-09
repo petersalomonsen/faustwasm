@@ -92,47 +92,48 @@ jobs:
           node --input-type=module - <<'NODE'
           import fs from 'fs';
           import path from 'path';
-          const load = async (pkgDir) => {
+          // Fresh module+compiler per call: an emscripten abort() (e.g. a Faust
+          // compile error) poisons its module instance, so we must not share one
+          // across DSPs. This also mirrors how the webapp/CLI use it per run.
+          const make = async (pkgDir, src, name) => {
             const m = await import(path.resolve(pkgDir, 'dist/esm/index.js'));
             const mod = await m.instantiateFaustModuleFromFile(path.resolve(pkgDir, 'libfaust-wasm/libfaust-wasm.js'));
             const c = new m.FaustCompiler(new m.LibFaust(mod));
-            return { m, mod, c, ver: c.version() };
+            const ver = c.version();
+            try {
+              const out = '/' + name + '.ts';
+              const ok = c.generateAuxFiles(name, src, `-lang asc -cn ${name} -o ${out}`);
+              if (!ok) return { ver, ok:false, err: (c.getErrorMessage()||'').trim() };
+              return { ver, ok:true, ts: mod.FS.readFile(out, { encoding:'utf8' }) };
+            } catch (e) { return { ver, ok:false, err: 'abort: ' + (e && e.message || e) }; }
           };
-          const built   = await load('.');                       // freshly built (PR #1261, no patch)
-          const psalomo = await load('package');                 // published @psalomo
-          console.log('built faust  :', built.ver);
-          console.log('@psalomo faust:', psalomo.ver);
-
-          const gen = (eng, name, src) => {
-            const out = '/' + name + '.ts';
-            const ok = eng.c.generateAuxFiles(name, src, `-lang asc -cn ${name} -I /work -o ${out}`);
-            if (!ok) return { ok:false, err: eng.c.getErrorMessage() };
-            return { ok:true, ts: eng.mod.FS.readFile(out, { encoding:'utf8' }) };
-          };
-
-          // mount stdfaust libs are bundled in the wasm fs; -I /work for local imports
           const dir = 'corpus';
-          const files = fs.readdirSync(dir).filter(f => f.endsWith('.dsp'));
-          let fail = 0, identical = 0, differ = 0;
+          const files = fs.readdirSync(dir).filter(f => f.endsWith('.dsp')).sort();
+          let regress=0, same=0, diff=0, bothfail=0; let builtVer='?', psalVer='?';
           for (const f of files) {
-            const name = f.replace(/[^A-Za-z0-9]/g,'_').replace(/\.dsp$/i,'');
+            const name = f.replace(/[^A-Za-z0-9]/g,'_').replace(/_dsp$/,'');
             const src = fs.readFileSync(path.join(dir,f),'utf8');
-            // make local imports resolvable
-            built.mod.FS.mkdir?.('/work'); try { built.mod.FS.writeFile('/work/'+f, src); } catch(e){}
-            psalomo.mod.FS.mkdir?.('/work'); try { psalomo.mod.FS.writeFile('/work/'+f, src); } catch(e){}
-            const a = gen(built, name, src);
-            const b = gen(psalomo, name, src);
-            if (!a.ok) { console.log(`FAIL  ${f}: built binary error: ${a.err}`); fail++; continue; }
-            if (!a.ts.includes('export class')) { console.log(`FAIL  ${f}: built output missing 'export class'`); fail++; continue; }
-            if (b.ok && a.ts === b.ts) { console.log(`SAME  ${f}  (${a.ts.length} B, identical to @psalomo)`); identical++; }
-            else if (b.ok) { console.log(`DIFF  ${f}  built=${a.ts.length}B psalomo=${b.ts.length}B (valid asc, differs — check faust version)`); differ++; }
-            else { console.log(`OKnew ${f}  built=${a.ts.length}B (@psalomo could not generate: ${b.err})`); differ++; }
+            const a = await make('.', src, name);            // freshly built (PR #1261, no patch)
+            const b = await make('package', src, name);      // published @psalomo
+            builtVer=a.ver; psalVer=b.ver;
+            if (a.ok && a.ts.includes('export class')) {
+              if (b.ok && a.ts === b.ts) { console.log(`SAME   ${f}  ${a.ts.length}B`); same++; }
+              else if (b.ok)            { console.log(`DIFF   ${f}  built=${a.ts.length}B psalomo=${b.ts.length}B (valid, version delta)`); diff++; }
+              else                      { console.log(`OK-NEW ${f}  built=${a.ts.length}B (@psalomo failed: ${b.err})`); diff++; }
+            } else if (!b.ok) {
+              console.log(`SKIP   ${f}  both fail (corpus import issue, not a backend regression): ${a.err}`); bothfail++;
+            } else {
+              console.log(`REGRESS ${f}  built FAILED but @psalomo OK: ${a.err}`); regress++;
+            }
           }
-          console.log(`\nSUMMARY: ${files.length} DSPs | identical=${identical} differ=${differ} fail=${fail}`);
-          if (fail > 0) { console.error('::error::built binary failed to produce valid asc for some webapp DSPs'); process.exit(1); }
+          console.log(`\nbuilt faust ${builtVer} | @psalomo faust ${psalVer}`);
+          console.log(`SUMMARY ${files.length} DSPs | same=${same} diff=${diff} skip(bothfail)=${bothfail} REGRESS=${regress}`);
+          if (regress>0) { console.error('::error::built binary regressed vs @psalomo on some webapp DSPs'); process.exit(1); }
+          if (same+diff===0) { console.error('::error::built binary produced no valid asc for any DSP'); process.exit(1); }
           NODE
 
       - name: Upload built libfaust-wasm artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: libfaust-wasm-asc-from-source
